@@ -1,0 +1,116 @@
+name: build-and-push
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/**'
+      - '.gitea/workflows/build-and-push.yml'
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Service to build ('all' or a single dir name)"
+        required: false
+        default: all
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: git.itqdev.xyz
+  NAMESPACE: 4x10m
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.set.outputs.services }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: set
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.service }}" != "all" ]; then
+            CHANGED="${{ github.event.inputs.service }}"
+          else
+            BEFORE="${{ github.event.before }}"
+            WORKFLOW_TOUCHED=""
+            if [ "${{ github.event_name }}" = "push" ]; then
+              WORKFLOW_TOUCHED=$(git diff --name-only "$BEFORE" "${{ github.sha }}" -- .gitea/workflows/build-and-push.yml 2>/dev/null || true)
+            fi
+
+            if [ "${{ github.event_name }}" != "push" ] \
+               || [ -z "$BEFORE" ] \
+               || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+               || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null \
+               || [ -n "$WORKFLOW_TOUCHED" ]; then
+              CHANGED=$(find services -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+            else
+              CHANGED=$(git diff --name-only "$BEFORE" "${{ github.sha }}" -- services/ \
+                        | awk -F/ 'NF>1 {print $2}' | sort -u)
+            fi
+          fi
+
+          JSON="["
+          FIRST=1
+          for s in $CHANGED; do
+            [ -d "services/$s" ] || continue
+            if [ "$FIRST" -eq 1 ]; then JSON="$JSON\"$s\""; FIRST=0; else JSON="$JSON,\"$s\""; fi
+          done
+          JSON="$JSON]"
+
+          echo "Changed services: $JSON"
+          echo "services=$JSON" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.detect.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Gitea registry
+        env:
+          REG_USER: ${{ secrets.REGISTRY_USER || github.actor }}
+          REG_TOKEN: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Logging in to $REGISTRY as $REG_USER"
+          echo "$REG_TOKEN" | docker login "$REGISTRY" -u "$REG_USER" --password-stdin
+
+      - name: Build & push ${{ matrix.service }}
+        working-directory: services/${{ matrix.service }}
+        run: |
+          set -euo pipefail
+          SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          export SECRET_KEY="${SECRET_KEY:-ci-build}"
+
+          export IMAGE_TAG=latest
+          docker compose build
+
+          IMAGES=$(docker compose config --images | grep "^${REGISTRY}/${NAMESPACE}/" | sort -u)
+          if [ -z "$IMAGES" ]; then
+            echo "No registry-owned images found for ${{ matrix.service }}" >&2
+            exit 1
+          fi
+
+          for img in $IMAGES; do
+            base="${img%:*}"
+            docker tag "$img" "${base}:${SHA}"
+            docker push "$img"
+            docker push "${base}:${SHA}"
+            echo "pushed $img and ${base}:${SHA}"
+          done
