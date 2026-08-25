@@ -50,4 +50,4 @@ print("", flush=True)
 
 ## CI/CD
 
-Там короче собирает вот, не забудьте добавить в compose.yaml `image: <>`
+Там короче собирает вот, не забудьте добавить в compose.yaml `image: git.itqdev.xyz/4x10m/<service>:${IMAGE_TAG:-latest}`
